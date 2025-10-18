@@ -45,6 +45,9 @@ This project is built upon the excellent open-source project [ProxmoxMCP](https:
   - Comprehensive parameter validation
   - Production-level logging
   - Complete unit test coverage
+- 🔐 **Secure HTTP API Enhancements**
+  - OAuth2 bearer token issuance for external integrations
+  - Real-time cluster status streaming via Server-Sent Events (SSE)
 
 ## Built With
 
@@ -128,9 +131,20 @@ Before starting, ensure you have:
            "level": "INFO",               # Optional: DEBUG for more detail
            "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
            "file": "proxmox_mcp.log"      # Optional: Log to file
-       }
-   }
-   ```
+        },
+        "api": {
+            "oauth_clients": [
+                {
+                    "client_id": "webui",
+                    "client_secret": "change-me",
+                    "scopes": ["cluster:read"]
+                }
+            ],
+            "access_token_ttl_seconds": 3600,    # Optional: Token lifetime (seconds)
+            "cluster_event_interval_seconds": 5  # Optional: SSE poll interval
+        }
+    }
+    ```
 
 ### Verifying Installation
 

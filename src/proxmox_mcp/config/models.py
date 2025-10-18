@@ -13,7 +13,7 @@ The models provide:
 - Field descriptions
 - Required vs optional field handling
 """
-from typing import Optional, Annotated
+from typing import Optional, Annotated, List
 from pydantic import BaseModel, Field
 
 class NodeStatus(BaseModel):
@@ -57,6 +57,22 @@ class AuthConfig(BaseModel):
     token_name: str  # Required: API token name
     token_value: str  # Required: API token secret
 
+
+class OAuthClient(BaseModel):
+    """Model representing an OAuth client credential pair."""
+
+    client_id: Annotated[str, Field(description="Public identifier for the OAuth client")]
+    client_secret: Annotated[str, Field(description="Private secret used to authenticate the client")]
+    scopes: Annotated[List[str], Field(default_factory=list, description="List of scopes granted to the client")]
+
+
+class APISettings(BaseModel):
+    """Model for HTTP API configuration."""
+
+    oauth_clients: Annotated[List[OAuthClient], Field(default_factory=list, description="Configured OAuth clients for token issuance")]
+    access_token_ttl_seconds: Annotated[int, Field(default=3600, ge=60, le=86400, description="Lifetime for issued access tokens in seconds")]
+    cluster_event_interval_seconds: Annotated[float, Field(default=5.0, gt=0, description="Polling interval for SSE cluster updates in seconds")]
+
 class LoggingConfig(BaseModel):
     """Model for logging configuration.
     
@@ -78,3 +94,4 @@ class Config(BaseModel):
     proxmox: ProxmoxConfig  # Required: Proxmox connection settings
     auth: AuthConfig  # Required: Authentication credentials
     logging: LoggingConfig  # Required: Logging configuration
+    api: APISettings = Field(default_factory=APISettings)  # Optional: HTTP API settings

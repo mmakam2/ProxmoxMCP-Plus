@@ -14,5 +14,16 @@
         "level": "DEBUG",
         "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         "file": "proxmox_mcp.log"
+    },
+    "api": {
+        "oauth_clients": [
+            {
+                "client_id": "webui",
+                "client_secret": "change-me",
+                "scopes": ["cluster:read"]
+            }
+        ],
+        "access_token_ttl_seconds": 3600,
+        "cluster_event_interval_seconds": 5.0
     }
 }

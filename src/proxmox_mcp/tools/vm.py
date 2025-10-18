@@ -419,13 +419,18 @@ class VMTools(ProxmoxTool):
         """
         try:
             result = await self.console_manager.execute_command(node, vmid, command)
-            # Use the command output formatter from ProxmoxFormatters
+            if self._default_style != "pretty":
+                import json
+
+                return [Content(type="text", text=json.dumps(result, indent=2))]
+
             from ..formatting import ProxmoxFormatters
+
             formatted = ProxmoxFormatters.format_command_output(
                 success=result["success"],
                 command=command,
                 output=result["output"],
-                error=result.get("error")
+                error=result.get("error"),
             )
             return [Content(type="text", text=formatted)]
         except Exception as e:

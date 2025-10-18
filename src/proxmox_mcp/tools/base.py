@@ -11,6 +11,7 @@ All tool implementations inherit from the ProxmoxTool base class to ensure
 consistent behavior and error handling across the MCP server.
 """
 import logging
+import os
 from typing import Any, Dict, List, Optional, Union
 from mcp.types import TextContent as Content
 from proxmoxer import ProxmoxAPI
@@ -37,8 +38,14 @@ class ProxmoxTool:
         """
         self.proxmox = proxmox_api
         self.logger = logging.getLogger(f"proxmox-mcp.{self.__class__.__name__.lower()}")
+        self._default_style = os.getenv("PROXMOX_MCP_OUTPUT_STYLE", "json").lower()
 
-    def _format_response(self, data: Any, resource_type: Optional[str] = None) -> List[Content]:
+    def _format_response(
+        self,
+        data: Any,
+        resource_type: Optional[str] = None,
+        style: Optional[str] = None,
+    ) -> List[Content]:
         """Format response data into MCP content using templates.
 
         This method handles formatting of various Proxmox resource types into
@@ -54,26 +61,35 @@ class ProxmoxTool:
         Returns:
             List of Content objects formatted according to resource type
         """
-        if resource_type == "nodes":
-            formatted = ProxmoxTemplates.node_list(data)
-        elif resource_type == "node_status":
-            # For node_status, data should be a tuple of (node_name, status_dict)
-            if isinstance(data, tuple) and len(data) == 2:
-                formatted = ProxmoxTemplates.node_status(data[0], data[1])
-            else:
-                formatted = ProxmoxTemplates.node_status("unknown", data)
-        elif resource_type == "vms":
-            formatted = ProxmoxTemplates.vm_list(data)
-        elif resource_type == "storage":
-            formatted = ProxmoxTemplates.storage_list(data)
-        elif resource_type == "containers":
-            formatted = ProxmoxTemplates.container_list(data)
-        elif resource_type == "cluster":
-            formatted = ProxmoxTemplates.cluster_status(data)
-        else:
-            # Fallback to JSON formatting for unknown types
+        output_style = (style or self._default_style).lower()
+
+        if output_style != "pretty":
             import json
-            formatted = json.dumps(data, indent=2)
+
+            return [Content(type="text", text=json.dumps(data, indent=2, default=str))]
+
+        try:
+            if resource_type == "nodes":
+                formatted = ProxmoxTemplates.node_list(data)
+            elif resource_type == "node_status":
+                if isinstance(data, tuple) and len(data) == 2:
+                    formatted = ProxmoxTemplates.node_status(data[0], data[1])
+                else:
+                    formatted = ProxmoxTemplates.node_status("unknown", data)
+            elif resource_type == "vms":
+                formatted = ProxmoxTemplates.vm_list(data)
+            elif resource_type == "storage":
+                formatted = ProxmoxTemplates.storage_list(data)
+            elif resource_type == "containers":
+                formatted = ProxmoxTemplates.container_list(data)
+            elif resource_type == "cluster":
+                formatted = ProxmoxTemplates.cluster_status(data)
+            else:
+                raise TypeError("Unsupported resource type")
+        except Exception:
+            import json
+
+            formatted = json.dumps(data, indent=2, default=str)
 
         return [Content(type="text", text=formatted)]
 
