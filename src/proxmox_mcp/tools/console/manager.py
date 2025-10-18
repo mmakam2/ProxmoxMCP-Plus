@@ -97,43 +97,50 @@ class VMConsoleManager:
             
             # Get the API endpoint
             # Use the guest agent exec endpoint
-            endpoint = self.proxmox.nodes(node).qemu(vmid).agent
-            self.logger.debug(f"Using API endpoint: {endpoint}")
-            
+            agent_api = self.proxmox.nodes(node).qemu(vmid).agent
+            self.logger.debug(f"Using API endpoint: {agent_api}")
+
             # Execute the command using two-step process
             try:
                 # Start command execution
                 self.logger.info("Starting command execution...")
                 try:
                     self.logger.debug(f"Executing command via agent: {command}")
-                    exec_result = endpoint("exec").post(command=command)
+                    exec_caller = getattr(agent_api, "exec", None)
+                    if exec_caller and hasattr(exec_caller, "post"):
+                        exec_result = exec_caller.post(command=command)
+                    else:
+                        exec_result = agent_api("exec").post(command=command)
                     self.logger.debug(f"Raw exec response: {exec_result}")
                     self.logger.info(f"Command started with result: {exec_result}")
                 except Exception as e:
                     self.logger.error(f"Failed to start command: {str(e)}")
                     raise RuntimeError(f"Failed to start command: {str(e)}")
 
-                if 'pid' not in exec_result:
-                    raise RuntimeError("No PID returned from command execution")
+                console = exec_result
+                if isinstance(exec_result, dict) and 'pid' in exec_result:
+                    pid = exec_result['pid']
+                    self.logger.info(f"Waiting for command completion (PID: {pid})...")
 
-                pid = exec_result['pid']
-                self.logger.info(f"Waiting for command completion (PID: {pid})...")
+                    # Add a small delay to allow command to complete
+                    import asyncio
+                    await asyncio.sleep(1)
 
-                # Add a small delay to allow command to complete
-                import asyncio
-                await asyncio.sleep(1)
-
-                # Get command output using exec-status
-                try:
-                    self.logger.debug(f"Getting status for PID {pid}...")
-                    console = endpoint("exec-status").get(pid=pid)
-                    self.logger.debug(f"Raw exec-status response: {console}")
-                    if not console:
-                        raise RuntimeError("No response from exec-status")
-                except Exception as e:
-                    self.logger.error(f"Failed to get command status: {str(e)}")
-                    raise RuntimeError(f"Failed to get command status: {str(e)}")
-                self.logger.info(f"Command completed with status: {console}")
+                    # Get command output using exec-status
+                    try:
+                        self.logger.debug(f"Getting status for PID {pid}...")
+                        status_caller = getattr(agent_api, "exec_status", None)
+                        if status_caller and hasattr(status_caller, "get"):
+                            console = status_caller.get(pid=pid)
+                        else:
+                            console = agent_api("exec-status").get(pid=pid)
+                        self.logger.debug(f"Raw exec-status response: {console}")
+                        if not console:
+                            raise RuntimeError("No response from exec-status")
+                    except Exception as e:
+                        self.logger.error(f"Failed to get command status: {str(e)}")
+                        raise RuntimeError(f"Failed to get command status: {str(e)}")
+                    self.logger.info(f"Command completed with status: {console}")
             except Exception as e:
                 self.logger.error(f"API call failed: {str(e)}")
                 raise RuntimeError(f"API call failed: {str(e)}")
@@ -143,12 +150,12 @@ class VMConsoleManager:
             # Handle different response structures
             if isinstance(console, dict):
                 # Handle exec-status response format
-                output = console.get("out-data", "")
-                error = console.get("err-data", "")
-                exit_code = console.get("exitcode", 0)
-                exited = console.get("exited", 0)
-                
-                if not exited:
+                output = console.get("out-data") or console.get("out", "")
+                error = console.get("err-data") or console.get("err", "")
+                exit_code = console.get("exitcode", console.get("exit_code", 0))
+                exited = console.get("exited", 1)
+
+                if not exited and 'pid' in exec_result:
                     self.logger.warning("Command may not have completed")
             else:
                 # Some versions might return data differently

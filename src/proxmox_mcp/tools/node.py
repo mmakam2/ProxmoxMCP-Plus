@@ -135,6 +135,11 @@ class NodeTools(ProxmoxTool):
         """
         try:
             result = self.proxmox.nodes(node).status.get()
-            return self._format_response((node, result), "node_status")
+            if self._default_style == "pretty":
+                return self._format_response((node, result), "node_status", style="pretty")
+
+            status_payload = dict(result) if isinstance(result, dict) else {"status": result}
+            status_payload.setdefault("node", node)
+            return self._format_response(status_payload, style="json")
         except Exception as e:
             self._handle_error(f"get status for node {node}", e)

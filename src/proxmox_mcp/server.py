@@ -14,6 +14,8 @@ The server exposes a set of tools for managing Proxmox resources including:
 - Storage management
 - Cluster status monitoring
 """
+import asyncio
+import json
 import logging
 import os
 import sys
@@ -24,11 +26,14 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.tools import Tool
 from mcp.types import TextContent as Content
 from pydantic import Field, BaseModel
-from fastapi import Body
+from fastapi import Body, Depends, FastAPI, HTTPException, status
+from fastapi.responses import StreamingResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from .config.loader import load_config
 from .core.logging import setup_logging
 from .core.proxmox import ProxmoxManager
+from .api import OAuthManager, TokenDetails
 from .tools.node import NodeTools
 from .tools.vm import VMTools
 from .tools.storage import StorageTools
@@ -69,7 +74,7 @@ class ProxmoxMCPServer:
         # Initialize core components
         self.proxmox_manager = ProxmoxManager(self.config.proxmox, self.config.auth)
         self.proxmox = self.proxmox_manager.get_api()
-        
+
         # Initialize tools
         self.node_tools = NodeTools(self.proxmox)
         self.vm_tools = VMTools(self.proxmox)
@@ -77,10 +82,12 @@ class ProxmoxMCPServer:
         self.cluster_tools = ClusterTools(self.proxmox)
         self.container_tools = ContainerTools(self.proxmox)
 
-        
+
         # Initialize MCP server
         self.mcp = FastMCP("ProxmoxMCP")
         self._setup_tools()
+        self.oauth_manager = OAuthManager(self.config.api)
+        self.api_app = self._create_api_app()
 
     def _setup_tools(self) -> None:
         """Register MCP tools with the server.
@@ -185,12 +192,16 @@ class ProxmoxMCPServer:
             include_stats: bool = Field(True, description="Include live stats and fallbacks")
             include_raw: bool = Field(False, description="Include raw status/config")
             format_style: Literal["pretty", "json"] = Field(
-                "pretty", description="'pretty' or 'json'"
+                "json", description="'pretty' or 'json'"
             )
 
         @self.mcp.tool(description=GET_CONTAINERS_DESC)
         def get_containers(
-            payload: GetContainersPayload = Body(..., embed=True, description="Container query options")
+            payload: GetContainersPayload = Body(
+                default=GetContainersPayload(),
+                embed=True,
+                description="Container query options",
+            )
         ):
             return self.container_tools.get_containers(
                 node=payload.node,
@@ -203,7 +214,7 @@ class ProxmoxMCPServer:
         @self.mcp.tool(description=START_CONTAINER_DESC)
         def start_container(
             selector: Annotated[str, Field(description="CT selector: '123' | 'pve1:123' | 'pve1/name' | 'name' | comma list")],
-            format_style: Annotated[str, Field(description="'pretty' or 'json'", pattern="^(pretty|json)$")] = "pretty",
+            format_style: Annotated[str, Field(description="'pretty' or 'json'", pattern="^(pretty|json)$")] = "json",
         ):
             return self.container_tools.start_container(selector=selector, format_style=format_style)
 
@@ -212,7 +223,7 @@ class ProxmoxMCPServer:
             selector: Annotated[str, Field(description="CT selector (see start_container)")],
             graceful: Annotated[bool, Field(description="Graceful shutdown (True) or forced stop (False)", default=True)] = True,
             timeout_seconds: Annotated[int, Field(description="Timeout for stop/shutdown", ge=1, le=600)] = 10,
-            format_style: Annotated[Literal["pretty","json"], Field(description="Output format")] = "pretty",
+            format_style: Annotated[Literal["pretty","json"], Field(description="Output format")] = "json",
         ):
             return self.container_tools.stop_container(
                selector=selector, graceful=graceful, timeout_seconds=timeout_seconds, format_style=format_style
@@ -221,7 +232,7 @@ class ProxmoxMCPServer:
         def restart_container(
             selector: Annotated[str, Field(description="CT selector (see start_container)")],
             timeout_seconds: Annotated[int, Field(description="Timeout for reboot", ge=1, le=600)] = 10,
-            format_style: Annotated[str, Field(description="'pretty' or 'json'", pattern="^(pretty|json)$")] = "pretty",
+            format_style: Annotated[str, Field(description="'pretty' or 'json'", pattern="^(pretty|json)$")] = "json",
         ):
             return self.container_tools.restart_container(
                selector=selector, timeout_seconds=timeout_seconds, format_style=format_style
@@ -235,7 +246,7 @@ class ProxmoxMCPServer:
             swap: Annotated[Optional[int], Field(description="New swap limit in MiB", ge=0)] = None,
             disk_gb: Annotated[Optional[int], Field(description="Additional disk size in GiB", ge=1)] = None,
             disk: Annotated[str, Field(description="Disk to resize", default="rootfs")] = "rootfs",
-            format_style: Annotated[Literal["pretty","json"], Field(description="Output format")] = "pretty",
+            format_style: Annotated[Literal["pretty","json"], Field(description="Output format")] = "json",
         ):
             return self.container_tools.update_container_resources(
                 selector=selector,
@@ -274,6 +285,74 @@ class ProxmoxMCPServer:
         except Exception as e:
             self.logger.error(f"Server error: {e}")
             sys.exit(1)
+
+    def _cluster_status_snapshot(self) -> dict:
+        """Return the latest cluster status snapshot for SSE streaming."""
+
+        try:
+            result = self.proxmox.cluster.status.get()
+            first_item = result[0] if result else {}
+            return {
+                "name": first_item.get("name"),
+                "quorum": first_item.get("quorate"),
+                "nodes": len([item for item in result if item.get("type") == "node"]),
+                "resources": [item for item in result if item.get("type") == "resource"],
+                "raw": result,
+            }
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            self.logger.error("Failed to retrieve cluster status for SSE: %s", exc)
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Unable to query cluster status") from exc
+
+    def _create_api_app(self) -> FastAPI:
+        """Create the FastAPI application exposing HTTP endpoints."""
+
+        app = FastAPI(title="Proxmox MCP API", version="1.0.0")
+        oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+        @app.post("/auth/token")
+        async def issue_token(form_data: OAuth2PasswordRequestForm = Depends()):
+            if not self.oauth_manager.is_configured:
+                raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "OAuth authentication is not configured")
+
+            client = self.oauth_manager.authenticate(form_data.username, form_data.password)
+            if not client:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid client credentials")
+
+            token = self.oauth_manager.issue_token(client, scopes=form_data.scopes)
+            return {
+                "access_token": token.token,
+                "token_type": "bearer",
+                "expires_in": self.oauth_manager.token_ttl,
+                "scope": " ".join(token.scopes),
+            }
+
+        async def get_current_client(token_value: str = Depends(oauth2_scheme)) -> TokenDetails:
+            try:
+                return self.oauth_manager.validate_token(token_value)
+            except PermissionError as exc:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+
+        @app.get("/events/cluster")
+        async def stream_cluster_events(_: TokenDetails = Depends(get_current_client)):
+            async def event_generator():
+                try:
+                    while True:
+                        payload = self._cluster_status_snapshot()
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        await asyncio.sleep(self.config.api.cluster_event_interval_seconds)
+                except asyncio.CancelledError:
+                    raise
+
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+        return app
+
+    def get_api_app(self) -> FastAPI:
+        """Return the FastAPI application instance."""
+
+        return self.api_app
 
 if __name__ == "__main__":
     config_path = os.getenv("PROXMOX_MCP_CONFIG")
